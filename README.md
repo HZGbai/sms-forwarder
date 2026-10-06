@@ -4,6 +4,8 @@ A self-hosted SMS forwarding system. An Android client listens for incoming
 messages on the device and pushes them to a Cloudflare Worker backend, which
 stores them in KV and serves a lightweight web page for browsing.
 
+*Important: Availability is only guaranteed on stock Android. If your system's restrictions prevent the app from being woken up, messages cannot be received.*
+
 ## Overview
 
 - **Client** — event driven. A message is uploaded as soon as it arrives, with a
