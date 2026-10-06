@@ -216,6 +216,8 @@ access field.
 | Messages stay queued and never upload      | Wrong server URL, password, or access field    |
 | Web page loads but the list stays empty    | Block rule matched, or no messages stored yet  |
 
+**Note:** When a large batch of messages arrives at once, the web UI may lag behind. This delay is usually under 30 seconds.
+
 ## License
 
 MIT License.
