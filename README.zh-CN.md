@@ -1,4 +1,6 @@
-# SMS Forwarder
+# 短信转发器
+
+简体中文 | [English](README.md)
 
 一个自托管的短信转发系统。安卓客户端监听手机收到的短信，将其推送到 Cloudflare
 Worker 后端，后端把短信存进 KV，并提供一个轻量网页用于浏览。
