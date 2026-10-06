@@ -1,5 +1,5 @@
 # SMS Forwarder
-[简体中文](README_zh.md) | English
+[简体中文](README.zh-CN.md) | English
 
 A self-hosted SMS forwarding system. An Android client listens for incoming
 messages on the device and pushes them to a Cloudflare Worker backend, which
