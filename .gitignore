@@ -1,0 +1,25 @@
+# Android / Gradle
+build/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+*.aab
+*.iml
+
+# Signing material - never commit these
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
+# Cloudflare Worker
+node_modules/
+.wrangler/
+.dev.vars
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
