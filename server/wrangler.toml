@@ -1,0 +1,23 @@
+name = "sms-forwarder"
+main = "workers.js"
+compatibility_date = "2026-09-01"
+
+# Keep this off: the WAF rules only apply to the custom domain below, so leaving
+# the *.workers.dev route enabled would let anyone bypass them.
+workers_dev = false
+
+# Replace with your own domain. custom_domain = true makes `wrangler deploy`
+# create the DNS record automatically.
+[[routes]]
+pattern = "your-subdomain.example.com"
+custom_domain = true
+
+# Replace the id with the one returned by `wrangler kv namespace create kv`.
+[[kv_namespaces]]
+binding = "kv"
+id = "00000000000000000000000000000000"
+
+[vars]
+# Warning: never put your password here. Store it as a secret instead:
+#   wrangler secret put ADMIN
+MAX_RECORDS = "200"
