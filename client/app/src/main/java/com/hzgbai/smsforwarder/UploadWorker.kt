@@ -13,6 +13,11 @@ import java.util.concurrent.TimeUnit
  * Posts queued messages to the Worker one by one, with exponential backoff and
  * a cap of MAX_ATTEMPTS retries so a misconfiguration cannot retry forever.
  *
+ * A bulk backlog is drained at a controlled rate: once the queue reaches
+ * BULK_THRESHOLD, consecutive sends are spaced SUBMIT_DELAY_MS apart so a large
+ * backfill does not arrive at the server as one burst. A one-off message is
+ * never delayed.
+ *
  * No NetworkType constraint is set on purpose: the target may be an intranet
  * address, so "has validated internet access" is not a valid precondition.
  * Without the constraint the job runs immediately in-process and retries cover
@@ -41,8 +46,19 @@ class UploadWorker(context: Context, params: WorkerParameters) : Worker(context,
             return Result.success()
         }
 
+        // Only a backlog gets throttled; a single message goes out immediately.
+        val bulk = pending >= BULK_THRESHOLD
+        if (bulk) {
+            LogStore.add(
+                ctx,
+                "$pending queued, spacing requests ${SUBMIT_DELAY_MS}ms apart",
+            )
+        }
+
         val sent = PendingQueue.drain(ctx, MAX_PER_RUN) { payload ->
-            ApiClient.send(ctx, prefs, payload)
+            val ok = ApiClient.send(ctx, prefs, payload)
+            if (bulk) sleepBetweenSends()
+            ok
         }
 
         val remaining = PendingQueue.size(ctx)
@@ -57,10 +73,25 @@ class UploadWorker(context: Context, params: WorkerParameters) : Worker(context,
         return Result.retry()
     }
 
+    /** Waits between two sends, restoring the interrupt flag if we are stopped. */
+    private fun sleepBetweenSends() {
+        try {
+            Thread.sleep(SUBMIT_DELAY_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     companion object {
         private const val UNIQUE_NAME = "sms-upload"
         private const val MAX_PER_RUN = 50
         private const val MAX_ATTEMPTS = 15
+
+        /** Queue length at or above which sends are spaced out. */
+        private const val BULK_THRESHOLD = 10
+
+        /** Gap between consecutive sends while draining a bulk backlog. */
+        private const val SUBMIT_DELAY_MS = 10L
 
         fun enqueue(ctx: Context) {
             val request = OneTimeWorkRequestBuilder<UploadWorker>()
