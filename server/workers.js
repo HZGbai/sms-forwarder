@@ -1,12 +1,7 @@
 /** The config */
 const MAX_BATCH = 500; // The maximum number of messages accepted in a single request.
 const DEFAULT_MAX_RECORDS = 200; // Fallback record limit used when MAX_RECORDS is not set.
-const LIST_PAGE = 1000; // Page size for KV list operations.
-
-const INDEX_KEY = "sms:index";
-const REC_PREFIX = "sms:rec:";
-const CID_PREFIX = "sms:cid:";
-const DEDUP_TTL = 60 * 60 * 24 * 7;
+const INSERT_CHUNK = 100; // Statements per D1 batch call.
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -53,7 +48,7 @@ function checkAdmin(request, env) {
   return { ok: true };
 }
 
-// ------------------------------------------------------------------ KV store
+// ------------------------------------------------------------------ D1 store
 
 function pad(n, len) {
   return String(n).padStart(len, "0");
@@ -75,108 +70,136 @@ function normalizeMax(value) {
   return Math.min(n, 5000);
 }
 
+// Columns are named from_addr / received_at etc. because `from` is a SQL
+// keyword; map back to the JSON field names the clients already expect.
+function rowToRecord(row) {
+  return {
+    id: row.id,
+    ts: row.ts,
+    receivedAt: row.received_at,
+    from: row.from_addr,
+    content: row.content,
+    device: row.device,
+    deviceTs: row.device_ts,
+    clientId: row.client_id,
+  };
+}
+
+const SELECT_COLUMNS =
+  "id, ts, received_at, from_addr, content, device, device_ts, client_id";
+
+const INSERT_SQL = `INSERT OR IGNORE INTO messages
+  (id, ts, received_at, from_addr, content, device, device_ts, client_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+
 class SmsStore {
-  constructor(kv, maxRecords) {
-    this.kv = kv;
+  constructor(db, maxRecords) {
+    this.db = db;
     this.max = normalizeMax(maxRecords);
   }
 
-  async readIndex() {
-    const raw = await this.kv.get(INDEX_KEY, "json");
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((id) => typeof id === "string" && id.length > 0);
+  /**
+   * Writes a batch of normalized messages.
+   *
+   * Deduplication is left to the unique index on client_id: a repeat insert is
+   * silently ignored by `INSERT OR IGNORE`, and `meta.changes === 0` is what
+   * tells us it was a duplicate. That removes the read-then-write race the old
+   * KV version had.
+   */
+  async appendMany(items) {
+    const prepared = items.map((item) => {
+      const id = buildId(item.ts);
+      return {
+        id,
+        clientId: item.clientId,
+        stmt: this.db
+          .prepare(INSERT_SQL)
+          .bind(
+            id,
+            item.ts,
+            new Date(item.ts).toISOString(),
+            item.from,
+            item.content,
+            item.device,
+            item.deviceTs,
+            item.clientId,
+          ),
+      };
+    });
+
+    const inserted = new Array(prepared.length).fill(false);
+
+    for (let i = 0; i < prepared.length; i += INSERT_CHUNK) {
+      const chunk = prepared.slice(i, i + INSERT_CHUNK);
+      const results = await this.db.batch(chunk.map((p) => p.stmt));
+      results.forEach((res, j) => {
+        inserted[i + j] = (res.meta?.changes ?? 0) > 0;
+      });
+    }
+
+    // For the rows that were ignored, look up which record already owns the
+    // client_id so the response can echo its id, as the KV version did.
+    const dupIds = new Map();
+    const dupClientIds = prepared.filter((p, i) => !inserted[i] && p.clientId).map((p) => p.clientId);
+    if (dupClientIds.length > 0) {
+      const placeholders = dupClientIds.map(() => "?").join(",");
+      const found = await this.db
+        .prepare(`SELECT client_id, id FROM messages WHERE client_id IN (${placeholders})`)
+        .bind(...dupClientIds)
+        .all();
+      for (const row of found.results ?? []) dupIds.set(row.client_id, row.id);
+    }
+
+    const evicted = await this.trim();
+
+    const results = prepared.map((p, i) =>
+      inserted[i]
+        ? { ok: true, id: p.id, duplicate: false }
+        : { ok: true, id: dupIds.get(p.clientId) ?? p.id, duplicate: true },
+    );
+
+    const duplicates = results.filter((r) => r.duplicate).length;
+    return { results, accepted: results.length - duplicates, duplicates, evicted };
   }
 
-  async append(input) {
-    const ts = Number.isFinite(input.ts) ? input.ts : Date.now();
-    const clientId = typeof input.clientId === "string" ? input.clientId.trim() : "";
-
-    if (clientId) {
-      const existingId = await this.kv.get(CID_PREFIX + clientId);
-      if (existingId) {
-        const existing = await this.kv.get(REC_PREFIX + existingId, "json");
-        if (existing) return { record: existing, duplicate: true, evicted: [] };
-      }
-    }
-
-    const record = {
-      id: buildId(ts),
-      ts,
-      receivedAt: new Date(ts).toISOString(),
-      from: String(input.from ?? "").slice(0, 128),
-      content: String(input.content ?? "").slice(0, 8000),
-      device: String(input.device ?? "").slice(0, 128),
-      deviceTs: Number.isFinite(input.deviceTs) ? input.deviceTs : null,
-      clientId: clientId || null,
-    };
-
-    await this.kv.put(REC_PREFIX + record.id, JSON.stringify(record));
-
-    if (clientId) {
-      await this.kv.put(CID_PREFIX + clientId, record.id, { expirationTtl: DEDUP_TTL });
-    }
-
-    const evicted = await this.#indexAppend(record.id);
-
-    return { record, duplicate: false, evicted };
-  }
-
-  async #indexAppend(id) {
-    let evicted = [];
-
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const index = await this.readIndex();
-      if (!index.includes(id)) {
-        index.push(id);
-        evicted = [];
-        while (index.length > this.max) {
-          const oldest = index.shift();
-          if (oldest) evicted.push(oldest);
-        }
-        await this.kv.put(INDEX_KEY, JSON.stringify(index));
-        if (evicted.length > 0) {
-          await Promise.all(evicted.map((oldId) => this.kv.delete(REC_PREFIX + oldId)));
-        }
-      }
-
-      const check = await this.readIndex();
-      if (check.includes(id)) return evicted;
-
-      await new Promise((r) => setTimeout(r, 40 * (attempt + 1)));
-    }
-
-    return evicted;
+  /**
+   * Enforces MAX_RECORDS. Everything past the newest `max` rows is deleted in
+   * one statement, so no row can survive outside the window.
+   *
+   * Ordering is by rowid rather than id: id carries a random suffix, so within
+   * one millisecond (a whole batch shares a ts) it would pick an arbitrary
+   * subset. rowid is the insertion sequence, which makes both the window and
+   * the listing deterministic. It stays monotonic because this trim only ever
+   * removes the oldest rows, so the highest rowid is never freed for reuse.
+   */
+  async trim() {
+    const res = await this.db
+      .prepare(
+        `DELETE FROM messages WHERE id IN (
+           SELECT id FROM messages ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?
+         )`,
+      )
+      .bind(this.max)
+      .run();
+    return res.meta?.changes ?? 0;
   }
 
   async list({ limit = 100, since = 0 } = {}) {
-    let index = await this.readIndex();
-    if (index.length === 0) index = await this.rebuildIndex();
-
-    const ids = index.slice().reverse();
-    const picked = [];
-    for (const id of ids) {
-      const rec = await this.kv.get(REC_PREFIX + id, "json");
-      if (!rec) continue;
-      if (since && Number(rec.ts) <= since) continue;
-      picked.push(rec);
-      if (picked.length >= limit) break;
-    }
-    return picked;
+    const res = await this.db
+      .prepare(
+        `SELECT ${SELECT_COLUMNS} FROM messages
+         WHERE ts > ?
+         ORDER BY ts DESC, rowid DESC
+         LIMIT ?`,
+      )
+      .bind(since, limit)
+      .all();
+    return (res.results ?? []).map(rowToRecord);
   }
 
-  async rebuildIndex() {
-    const ids = [];
-    let cursor;
-    do {
-      const page = await this.kv.list({ prefix: REC_PREFIX, cursor, limit: LIST_PAGE });
-      for (const key of page.keys) ids.push(key.name.slice(REC_PREFIX.length));
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-
-    ids.sort(); // The id prefix is a zero-padded timestamp, so lexicographic order equals time order.
-    const trimmed = ids.slice(-this.max);
-    await this.kv.put(INDEX_KEY, JSON.stringify(trimmed));
-    return trimmed;
+  async count() {
+    const res = await this.db.prepare("SELECT COUNT(*) AS n FROM messages").first();
+    return res?.n ?? 0;
   }
 }
 
@@ -342,8 +365,8 @@ function text(body, status = 200, contentType = "text/plain; charset=utf-8") {
 }
 
 function getStore(env) {
-  if (!env.kv) throw new Error("Missing KV binding, check wrangler.toml");
-  return new SmsStore(env.kv, normalizeMax(env.MAX_RECORDS));
+  if (!env.DB) throw new Error("Missing D1 binding, check wrangler.toml");
+  return new SmsStore(env.DB, normalizeMax(env.MAX_RECORDS));
 }
 
 function normalizeOne(raw) {
@@ -353,12 +376,17 @@ function normalizeOne(raw) {
   if (!from && !content) return null;
 
   const deviceTs = Number(raw.deviceTs ?? raw.date ?? raw.timestamp);
+  const rawClientId = raw.clientId ?? raw.id ?? "";
+  const clientId = String(rawClientId).trim();
+
   return {
     from: from || "(Unknown)",
-    content,
-    device: raw.device ?? "",
+    content: content.slice(0, 8000),
+    device: String(raw.device ?? "").slice(0, 128),
     deviceTs: Number.isFinite(deviceTs) && deviceTs > 0 ? deviceTs : null,
-    clientId: raw.clientId ?? raw.id ?? "",
+    // Empty means "no idempotency key" and must become NULL, otherwise every
+    // such message would collide on the unique index and be dropped.
+    clientId: clientId ? clientId.slice(0, 256) : null,
     ts: Date.now(),
   };
 }
@@ -378,27 +406,38 @@ async function handleIngest(request, env) {
   }
 
   const store = getStore(env);
-  const results = [];
+
+  // Keep the input order so the per-item results line up with what was sent,
+  // but only hand valid rows to the store.
+  const results = new Array(rawList.length);
+  const valid = [];
+  const validIndex = [];
+
+  rawList.forEach((raw, i) => {
+    const item = normalizeOne(raw);
+    if (!item) {
+      results[i] = { ok: false, error: "Missing sender or content" };
+    } else {
+      valid.push(item);
+      validIndex.push(i);
+    }
+  });
+
   let accepted = 0;
   let duplicates = 0;
   let evictedTotal = 0;
 
-  for (const raw of rawList) {
-    const item = normalizeOne(raw);
-    if (!item) {
-      results.push({ ok: false, error: "Missing sender or content" });
-      continue;
-    }
+  if (valid.length > 0) {
     try {
-      const { record, duplicate, evicted } = await store.append(item);
-      if (duplicate) duplicates += 1;
-      else {
-        accepted += 1;
-        evictedTotal += evicted?.length || 0;
-      }
-      results.push({ ok: true, id: record.id, duplicate: Boolean(duplicate) });
+      const out = await store.appendMany(valid);
+      out.results.forEach((r, j) => {
+        results[validIndex[j]] = r;
+      });
+      accepted = out.accepted;
+      duplicates = out.duplicates;
+      evictedTotal = out.evicted;
     } catch (err) {
-      results.push({ ok: false, error: err.message });
+      for (const idx of validIndex) results[idx] = { ok: false, error: err.message };
     }
   }
 
@@ -444,11 +483,13 @@ export default {
       }
       if (path === "/api/health") {
         if (request.method !== "GET") return json({ ok: false, error: "Method Not Allowed" }, 405);
+        const store = getStore(env);
         return json({
           ok: true,
           service: "sms-forwarder",
-          kv: Boolean(env.kv),
-          maxRecords: normalizeMax(env.MAX_RECORDS),
+          db: true,
+          stored: await store.count(),
+          maxRecords: store.max,
         });
       }
       const auth = checkAdmin(request, env);

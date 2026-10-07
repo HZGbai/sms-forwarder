@@ -1,4 +1,4 @@
-name = "sms-forwarder"
+name = "sms"
 main = "workers.js"
 compatibility_date = "2026-09-01"
 
@@ -12,12 +12,15 @@ workers_dev = false
 pattern = "your-subdomain.example.com"
 custom_domain = true
 
-# Replace the id with the one returned by `wrangler kv namespace create kv`.
-[[kv_namespaces]]
-binding = "kv"
-id = "00000000000000000000000000000000"
+# Create the database once, then paste the id it prints:
+#   npx wrangler d1 create sms-forwarder
+# The binding name must be `DB`; the Worker looks it up by that name.
+[[d1_databases]]
+binding = "DB"
+database_name = "sms"
+database_id = "c8b7129b-356a-45ef-b4cb-01f48cb9ddbc"
 
 [vars]
 # Warning: never put your password here. Store it as a secret instead:
-#   wrangler secret put ADMIN
+#   npx wrangler secret put ADMIN
 MAX_RECORDS = "200"
